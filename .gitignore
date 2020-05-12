@@ -1,0 +1,11 @@
+*.mat
+*.pickle
+*.zip
+*.gz
+*.rar
+*.index
+*.meta
+*.dat
+dataset/
+__pycache__/
+models/
