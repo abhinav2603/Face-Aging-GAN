@@ -31,7 +31,7 @@ logger = 'logger.txt'
 parser = argparse.ArgumentParser()
 parser.add_argument('--resume', action = 'store_true')
 args = parser.parse_args()
-checkpoint_path = '.'
+checkpoint_path = 'checkpoints/'
 #----------PARAMETERS----------------------------------------------------------#
 
 lr = 0.001
@@ -58,7 +58,7 @@ def get_training_dataloader():
         #transforms.RandomHorizontalFlip(),
         transforms.Resize(128),
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        # transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
         ])
 
     trainset = IMDB_Face_Both(train = True, transform = train_transform)
@@ -72,7 +72,7 @@ def get_test_dataloader():
         transforms.ToPILImage(),
         transforms.Resize(128),
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+        # transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
         ])
 
     test_dataset = IMDB_Face_Both(train = False, transform = test_transform)
@@ -141,17 +141,14 @@ batch_num = 0
 #Saving and Loading the  model
 def save_pickle(e, batch_num, name = 'data.pickle'):
     dic = {}
-    dic['Glosses'] = G_losses
-    dic['Dlosses'] = D_losses
-    dic['epoch'] = epoch_lst
-    dic['batch_num'] = batch_num_lst
-    dic['accuracies'] = accuracies
-    with open(checkpoint_path + name, 'wb') as handle:
+    dic['G_losses'] = G_losses
+    dic['D_losses'] = D_losses
+    with open(os.path.join(checkpoint_path, name), 'wb') as handle:
         pickle.dump(dic, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-def save_checkpoint(e, batch_num, filename=checkpoint_path + 'checkpoint.pth.tar'):
+def save_checkpoint(e, batch_num, netG, netD, optimizerG, optimizerD, schedulerG, schedulerD, filename=os.path.join(checkpoint_path, 'checkpoint.pth.tar')):
     state = {
-            'epoch': e + 1,
+            'epoch': e,
             'batch_num': batch_num,
             'gen_dict': netG.state_dict(),
             'disc_dict': netD.state_dict(), 
@@ -162,15 +159,17 @@ def save_checkpoint(e, batch_num, filename=checkpoint_path + 'checkpoint.pth.tar
         }
 
     torch.save(state, filename)
-    print('Saving the model after {} epochs'.format(e+1))
-    # save_pickle(e, batch_num, 'checkpoint.pickle')
+    print('Saving the model after {} batches of epoch {}'.format(batch_num, e))
+    save_pickle(e, batch_num, 'checkpoint.pickle')
 
-def load_checkpoint(filename=checkpoint_path + 'checkpoint.pth.tar'):
+def load_checkpoint(filename=os.path.join(checkpoint_path, 'checkpoint.pth.tar')):
     if os.path.isfile(filename):
         print("=> loading checkpoint '{}'".format(filename))
         checkpoint = torch.load(filename)
-        global start_epoch
-        start_epoch = checkpoint['epoch']
+        global memory_start_epoch
+        global memory_start_batch_num
+        memory_start_epoch = checkpoint['epoch']
+        memory_start_batch_num = checkpoint['batch_num']
         netG.load_state_dict(checkpoint['gen_dict'])
         netD.load_state_dict(checkpoint['disc_dict'])
         optimizerD.load_state_dict(checkpoint['optimizerD'])
@@ -182,64 +181,90 @@ def load_checkpoint(filename=checkpoint_path + 'checkpoint.pth.tar'):
     else:
         print("=> no checkpoint found at '{}'".format(filename))
 
-    # if os.path.isfile(checkpoint_path + 'checkpoint.pickle'):
-    #     with open(checkpoint_path + 'checkpoint.pickle', 'rb') as handle:
-    #         dic = pickle.load(handle)
-    #         global memory_losses
-    #         global memory_accuracies
-    #         global memory_epoch_lst
-    #         global memory_batch_num_lst
-    #         memory_losses = dic['losses']
-    #         memory_epoch_lst = dic['epoch']
-    #         memory_batch_num_lst = dic['batch_num']
-    #         memory_accuracies = dic['accuracies']
-    #         print('Loaded data\n\n')
-    # else:
-    #     print("=> no checkpoint found at '{}'".format(checkpoint_path + 'checkpoint.pickle'))
+    if os.path.isfile(checkpoint_path + 'checkpoint.pickle'):
+        with open(checkpoint_path + 'checkpoint.pickle', 'rb') as handle:
+            dic = pickle.load(handle)
+            global memory_G_losses
+            global memory_D_losses
+            memory_G_losses = dic['G_losses']
+            memory_D_losses = dic['D_losses']
+            print('Loaded data\n\n')
+    else:
+        print("=> no checkpoint found at '{}'".format(checkpoint_path + 'checkpoint.pickle'))
 
 if args.resume:
     load_checkpoint()
-    # losses = memory_losses
-    # epoch_lst = memory_epoch_lst
-    # batch_num_lst = memory_batch_num_lst
-    # accuracies = memory_accuracies
-        
+    G_losses = memory_G_losses
+    D_losses = memory_D_losses
+    start_epoch = memory_start_epoch
+    start_batch_num = memory_start_batch_num
     print('Resuming Training\n')
 else:
     print('Starting Training\n')
     start_epoch = 0
+    start_batch_num = 0
 #------------------------------------------------------------------------------#
-def train(epoch):
+def train(epoch, skip_batches = 0):
     bar = progressbar.ProgressBar(maxval=len(trainloader), \
     widgets=[progressbar.Bar('=', '[', ']'), ' ', progressbar.Percentage()])
     bar.start()
     bari = 0
     for batch_num, (images,_,labels) in enumerate(trainloader,0):
+        if skip_batches > 0:
+            skip_batches -= 1
+            bari += 1
+            continue
+        bar.update(bari)
         #print("==========>",labels)
-        # netD.zero_grad() 
+        # Discriminator training
         optimizerD.zero_grad()
-        images =  images.to(device)
-        labels = labels.to(device)
+        oldimages =  images[labels == 1,:,:,:].to(device)
+        oldlabels = labels[labels == 1].to(device)
+        youngimages =  images[labels == 0,:,:,:].to(device)
+        younglabels = labels[labels == 0].to(device)
+        num_old = (labels == 1).sum()
+        num_young = (labels == 0).sum()
 
-        #Discriminator on real image
-        real_image = images.to(device)
-        output = netD(real_image)
-        D_x = output.mean()
-        real_label = torch.ones(output.shape,device=device)
-        Ld_real = criterion(output,real_label)
+        if not num_old == 0:
+            #Discriminator on real image
+            output = netD(oldimages)
+            D_x = output.mean()
+            real_label = torch.ones(output.shape,device=device)
+            Ld_real = criterion(output,real_label)
+        else:
+            Ld_real = 0
 
-        #Discriminator on fake image
-        n,_,h,w = images.shape
-        condition = torch.zeros(n,2,h,w).to(device)
-        for k,j in enumerate(labels):
-            condition[k,1-j,:,:]=1
+        if not num_young == 0:
+            #Discriminator on fake image
+            n,_,h,w = youngimages.shape
+            condition = torch.zeros(n,2,h,w).to(device)
+            for k,j in enumerate(younglabels):
+                condition[k,1-j,:,:]=1
 
-        inputG = torch.cat((real_image,condition),1).to(device)
-        fake_image = netG(inputG)
-        output = netD(fake_image.detach())
-        D_G_z1 = output.mean()
-        fake_label = torch.zeros(output.shape,device=device)
-        Ld_fake = criterion(output,fake_label)
+            inputG = torch.cat((youngimages,condition),1).to(device)
+            with torch.no_grad():
+                fake_image = netG(inputG)
+
+        # with open('outp.txt', 'w') as f:
+        #     f.write(str(fake_image))
+        #     f.write('\nFake above')
+        #     f.write('\n')
+        #     image_otpt = np.transpose(fake_image[0].cpu().detach().numpy(),[1,2,0])
+        #     to_write = (image_otpt*255).astype(np.uint8)
+        #     f.write(str(to_write))
+        #     f.write('\n')
+        #     f.write('\n')
+        #     f.write(str(to_write.shape))
+        #     f.write(str(fake_image.shape))
+
+            output = netD(fake_image)
+            D_G_z1 = output.mean()
+            fake_label = torch.zeros(output.shape,device=device)
+            Ld_fake = criterion(output,fake_label)
+        else:
+            Ld_fake = 0
+        
+
         errD =  .5*(Ld_real + Ld_fake)
         #print(errD.requires_grad)
         errD.backward()
@@ -249,33 +274,39 @@ def train(epoch):
         idnet.eval()
         agenet.eval()
 
-        #Generator
+        #Generator training
 
-        #netG.zero_grad()
-        optimizerG.zero_grad()
-        
-        output = netD(fake_image)
-        #Loss due to the discriminator
-        Lg = criterion(output,real_label)
-        D_G_z2 = output.mean()
+        if not num_young == 0:
+            inputG = torch.cat((youngimages,condition),1).to(device)
+            fake_image = netG(inputG)
 
-        fake_features = idnet.ifeatures(fake_image)
-        real_features = idnet.ifeatures(real_image)
+            #netG.zero_grad()
+            optimizerG.zero_grad()
+            
+            with torch.no_grad():
+                output = netD(fake_image)
+                real_label = torch.ones(output.shape,device=device)
+            #Loss due to the discriminator
+            Lg = criterion(output,real_label)
+            D_G_z2 = output.mean()
 
-        #Identity preserving module loss
-        Lid = criterion(fake_features,real_features)
+            fake_features = idnet.ifeatures(fake_image)
+            real_features = idnet.ifeatures(youngimages)
 
-        #Age enforcing loss
-        pred_age = agenet(fake_image) 
-        Lage = age_criterion(pred_age,1-labels)
-        errG = lambda1*.5*Lg + lambda2*Lid + lambda3*Lage
-        errG.backward()
-        optimizerG.step()
+            #Identity preserving module loss
+            Lid = criterion(fake_features,real_features)
+
+            #Age enforcing loss
+            pred_age = agenet(fake_image) 
+            Lage = age_criterion(pred_age,1-younglabels)
+            errG = lambda1*.5*Lg + lambda2*Lid + lambda3*Lage
+            errG.backward()
+            optimizerG.step()
 
         if batch_num % 50 == 0:
             image_inpt = np.transpose(images[0].cpu().detach().numpy(),[1,2,0])
             plt.figure()
-            plt.imshow(image_inpt)
+            plt.imshow((image_inpt*255).astype(np.uint8))
             plt.savefig('src/fundo.png')
             plt.close('all')
             print('\n[%d/%d][%d/%d]\tLoss_D: %.4f\tLoss_G: %.4f\tD(x): %.4f\tD(G(z)): %.4f / %.4f'
@@ -285,22 +316,23 @@ def train(epoch):
             # with open('logger.txt','w') as f1:
             #     f1.write('[%d/%d][%d/%d]\tLoss_D: %.4f\tLoss_G: %.4f\tD(x): %.4f\tD(G(z)): %.4f / %.4f' % (epoch, epochs, i, len(trainloader),errD.item(), errG.item(), D_x, D_G_z1, D_G_z2))
 
-        if batch_num % 200 == 0:
-            image_inpt = np.transpose(images[0].cpu().detach().numpy(),[1,2,0])
-            image_otpt = np.transpose(fake_image[0].cpu().detach().numpy(),[1,2,0])
-            plt.figure()
-            plt.subplot(121)
-            plt.imshow(image_inpt)
-            plt.subplot(122)
-            plt.imshow(image_otpt)
-            plt.savefig('src/Output.png')
-            plt.close('all')
-
         G_losses.append(errG.item())
         D_losses.append(errD.item())
         D_X.append(D_x.item())
         D_Gz1.append(D_G_z1.item())
         D_Gz2.append(D_G_z2.item())
+
+        if batch_num % 200 == 0 and (not num_young == 0):
+            image_inpt = np.transpose(images[0].cpu().detach().numpy(),[1,2,0])
+            image_otpt = np.transpose(fake_image[0].cpu().detach().numpy(),[1,2,0])
+            plt.figure()
+            plt.subplot(121)
+            plt.imshow((image_inpt*255).astype(np.uint8))
+            plt.subplot(122)
+            plt.imshow((image_otpt*255).astype(np.uint8))
+            plt.savefig('src/Output.png')
+            plt.close('all')
+            save_checkpoint(epoch, batch_num, netG, netD, optimizerG, optimizerD, schedulerG, schedulerD)
 
         bari += 1
         bar.update(bari)
@@ -310,14 +342,13 @@ def train(epoch):
 #Training thee GAN
 print("Starting Training Loop...")
 for e in range(epochs):
-    save_checkpoint(e, batch_num)
-    e += start_epoch
-    if e >= epochs:
-        break
-    train(e)
+    if start_epoch > 0:
+        start_epoch -= 1
+        continue
+    train(e, skip_batches = start_batch_num)
+    start_batch_num = 0
     schedulerG.step()
     schedulerD.step()
     
     print('\n')    
-    # save_checkpoint(e, batch_num, model, optimizer)
 
